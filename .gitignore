@@ -4,4 +4,7 @@ distilled_student*
 results*
 student_FRIDA*
 pipeline_runs/
+pipeline_runs_v2/
 *.parquet
+wandb/
+hf_datasets/

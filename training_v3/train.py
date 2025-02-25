@@ -18,6 +18,10 @@ from torch.distributed.elastic.multiprocessing.errors import record
 from torch.nn.parallel import DistributedDataParallel as DDP
 import wandb
 
+# Import evaluation function from evaluate script
+from evaluate import evaluate_model
+
+# Set up logging
 root_logger = logging.getLogger()
 if root_logger.handlers:
     root_logger.handlers = []
@@ -108,35 +112,41 @@ def build_student_model(teacher_model, new_num_heads, blocks_to_keep_indices):
     student_model.encoder.final_layer_norm = teacher_model.encoder.final_layer_norm
     return student_model
 
-
 def load_training_dataset(tokenizer, limit=50000, cache_file="tokenized_cache.parquet", local_rank=-1):
     if local_rank != -1 and not torch.distributed.is_initialized():
         torch.distributed.init_process_group(backend="nccl", init_method="env://")
-    if local_rank <= 0:  # Only rank 0 (or single GPU) performs tokenization
+    if local_rank <= 0:
         if os.path.exists(cache_file):
             logger.info(f"Rank {local_rank}: Loading tokenized dataset from cache...")
         else:
             logger.info(f"Rank {local_rank}: Tokenized cache not found. Loading and tokenizing raw dataset...")
-            data_files = {
-                "train": [
-                    "data/train-00000-of-00083-5a836a36820bbc21.parquet",
-                    "data/train-00001-of-00083-6a059492052de562.parquet",
-                    "data/train-00002-of-00083-6ab99ef2eda1556f.parquet",
-                    "data/train-00003-of-00083-fc34df8e6a0b97a4.parquet",
-                    "data/train-00004-of-00083-a2a0fa5d28e7d578.parquet",
-                    "data/train-00005-of-00083-806fed410a43fb46.parquet",
-                    "data/train-00006-of-00083-d6b9c39127b6005d.parquet",
-                    "data/train-00007-of-00083-206cf23f973bc8bf.parquet",
-                    "data/train-00008-of-00083-7798c30b513dd0ef.parquet",
-                ]
-            }
-            ds = load_dataset("cointegrated/taiga_stripped_proza", data_files=data_files, ignore_verifications=True)["train"]
+            # data_files = {
+            #     "train": [
+            #         "data/train-00000-of-00083-5a836a36820bbc21.parquet",
+            #         "data/train-00001-of-00083-6a059492052de562.parquet",
+            #         "data/train-00002-of-00083-6ab99ef2eda1556f.parquet",
+            #         "data/train-00003-of-00083-fc34df8e6a0b97a4.parquet",
+            #         "data/train-00004-of-00083-a2a0fa5d28e7d578.parquet",
+            #         "data/train-00005-of-00083-806fed410a43fb46.parquet",
+            #         "data/train-00006-of-00083-d6b9c39127b6005d.parquet",
+            #         "data/train-00007-of-00083-206cf23f973bc8bf.parquet",
+            #         "data/train-00008-of-00083-7798c30b513dd0ef.parquet",
+            #         "data/train-00009-of-00083-c787d06e48840b95.parquet", 
+            #         "data/train-00010-of-00083-66b33c44bfe0c7b5.parquet",
+            #         "data/train-00011-of-00083-78892dcef5e8b81a.parquet",
+            #         "data/train-00012-of-00083-87b563f3f9bce3cf.parquet",
+            #     ]
+            # }
+            ds = load_dataset("cointegrated/taiga_stripped_proza", 
+                            #   data_files=data_files, 
+                              ignore_verifications=True,
+                              cache_dir="./hf_datasets", num_proc=8)["train"]
 
             def flatten(example):
                 paragraphs = [p.strip() for p in re.split(r"\n\s*\n", example["text"]) if p.strip()]
                 return {"text": "categorize_topic: " + " ".join(paragraphs)}
 
-            ds = ds.map(flatten, batched=False)
+            ds = ds.map(flatten, batched=False, num_proc=16)
             if len(ds) > limit:
                 ds = ds.select(range(limit))
 
@@ -148,44 +158,39 @@ def load_training_dataset(tokenizer, limit=50000, cache_file="tokenized_cache.pa
             ds.set_format(type="torch", columns=["input_ids", "attention_mask"])
             logger.info(f"Rank {local_rank}: Saving tokenized dataset to cache...")
             ds.to_parquet(cache_file)
-
-    # Synchronize all processes to ensure rank 0 has finished tokenization
     if dist.is_initialized():
         logger.info(f"Stumbled into barrier {local_rank} rank")
         dist.barrier()
-
-    # All ranks (including rank 0) load the cached dataset
     logger.info(f"Rank {local_rank}: Loading tokenized dataset from cache...")
     ds = load_dataset("parquet", data_files={"train": cache_file})["train"]
     ds.set_format(type="torch", columns=["input_ids", "attention_mask"])
     return ds
 
-
 def distillation_loss(student_hidden, teacher_hidden, temperature=2.0, alpha=0.5):
     student_logits = student_hidden / temperature
     teacher_logits = teacher_hidden / temperature
-    kl_loss = F.kl_div(torch.log_softmax(student_logits, dim=-1), torch.softmax(teacher_logits, dim=-1), reduction="batchmean") * (temperature ** 2)
+    kl_loss = F.kl_div(torch.log_softmax(student_logits, dim=-1),
+                       torch.softmax(teacher_logits, dim=-1),
+                       reduction="batchmean") * (temperature ** 2)
     mse_loss = F.mse_loss(student_hidden, teacher_hidden)
     return alpha * mse_loss + (1 - alpha) * kl_loss
 
 @record
-def run_distillation(teacher_model, student_model, tokenizer, train_dataset, output_dir, num_train_epochs=1, batch_size=32, learning_rate=2e-5, epoch_to_max_length=None, default_token_len=512):
-    wandb.init(
-        # set the wandb entity where your project will be logged (generally your team name)
-        entity="my-awesome-team-name",
-
-        # set the wandb project where this run will be logged
-        project="my-awesome-project",
-
-        # track hyperparameters and run metadata
-        config={
-        "learning_rate": 1e-4,
-        "architecture": "t5-encoder",
-        "dataset": "RussianProzaTaiga",
-        "epochs": 5,
-        }
-    )
+def run_distillation(teacher_model, student_model, tokenizer, train_dataset, output_dir,
+                     num_train_epochs=1, batch_size=32, learning_rate=2e-5, epoch_to_max_length=None,
+                     default_token_len=512):
     local_rank = int(os.environ["LOCAL_RANK"]) if "LOCAL_RANK" in os.environ else -1
+    if local_rank == 0:
+        wandb.init(
+            entity="topapec-none",
+            project="microfrida",
+            config={
+                "learning_rate": 1e-4,
+                "architecture": "t5-encoder",
+                "dataset": "RussianProzaTaiga",
+                "epochs": 5,
+            }
+        )
     device = torch.device(f"cuda:{local_rank}" if local_rank != -1 else ("cuda" if torch.cuda.is_available() else "cpu"))
     torch.cuda.set_device(device)
     if local_rank != -1 and not torch.distributed.is_initialized():
@@ -202,8 +207,8 @@ def run_distillation(teacher_model, student_model, tokenizer, train_dataset, out
     alpha = 0.5
     global_step = 0
     student_model.train()
+    total_loss = 0.0
     for epoch in range(num_train_epochs):
-        # Retrieve max token length for this epoch from the config mapping or use the default value.
         max_tokens = epoch_to_max_length.get(epoch, default_token_len) if epoch_to_max_length is not None else default_token_len
         if sampler is not None:
             sampler.set_epoch(epoch)
@@ -211,7 +216,6 @@ def run_distillation(teacher_model, student_model, tokenizer, train_dataset, out
             if isinstance(batch, list):
                 batch = {k: torch.stack([item[k] for item in batch]) for k in batch[0].keys()}
             batch = {k: (torch.tensor(v) if isinstance(v, list) else v).to(device) for k, v in batch.items()}
-            # Truncate sequences to the designated max_tokens length per epoch.
             if 'input_ids' in batch:
                 if batch['input_ids'].size(1) > max_tokens:
                     batch['input_ids'] = batch['input_ids'][:, :max_tokens]
@@ -227,8 +231,10 @@ def run_distillation(teacher_model, student_model, tokenizer, train_dataset, out
             loss.backward()
             optimizer.step()
             global_step += 1
+            total_loss += loss.item()
             if local_rank == 0 and global_step % 10 == 0:
                 logger.info(f"Epoch {epoch} Step {global_step}: Loss = {loss.item()}")
+                wandb.log({"loss": loss.item(), "avg_loss": total_loss / global_step})
     logger.info(f"I AM {local_rank} gpu!")
     if local_rank == 0:
         os.makedirs(output_dir, exist_ok=True)
@@ -246,7 +252,7 @@ def run_distillation(teacher_model, student_model, tokenizer, train_dataset, out
 @record
 def main():
     local_rank = int(os.environ["LOCAL_RANK"]) if "LOCAL_RANK" in os.environ else -1
-    logger.info(f"WTF I AM IN TRAIN MAIN {local_rank}")
+    logger.info(f"Training on local rank: {local_rank}")
     device = torch.device(f"cuda:{local_rank}" if local_rank != -1 else ("cuda" if torch.cuda.is_available() else "cpu"))
     torch.cuda.set_device(device)
     if local_rank != -1 and not torch.distributed.is_initialized():
@@ -259,4 +265,24 @@ def main():
     base_teacher = teacher_model.module if hasattr(teacher_model, "module") else teacher_model
     student_model = build_student_model(base_teacher, new_num_heads=12, blocks_to_keep_indices=[0, 23])
     student_model.to(device)
-    steps, student
+    output_dir = "output"
+    steps, student_path = run_distillation(teacher_model, student_model, teacher_tokenizer,
+                                           train_dataset, output_dir, num_train_epochs=1,
+                                           batch_size=32, learning_rate=2e-5)
+    
+    # After training, evaluate the distilled student model using MTEB benchmark.
+    if local_rank == 0 and student_path is not None:
+        logger.info("Starting evaluation of the distilled model using MTEB benchmark...")
+        results, stats = evaluate_model(student_path, tasks=["GeoreviewClusteringP2P"], eval_output_folder="eval_results")
+        # Assuming that results is a dictionary containing "main_score"
+        main_score = results["scores"]["test"][0].get("main_score")
+        if main_score is not None:
+            wandb.log({"mteb_main_score": main_score})
+            logger.info(f"Logged MTEB main_score: {main_score} to wandb")
+        else:
+            logger.warning("MTEB main_score not found in evaluation results.")
+    
+    return steps, student_path
+
+if __name__ == "__main__":
+    main()

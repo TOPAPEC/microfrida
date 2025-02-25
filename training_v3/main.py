@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 from transformers import T5EncoderModel, AutoTokenizer
 from train import build_student_model, load_training_dataset, run_distillation
 from evaluate import evaluate_model
+import wandb
 
 def main():
     local_rank = int(os.environ["LOCAL_RANK"]) if "LOCAL_RANK" in os.environ else -1
@@ -12,7 +13,7 @@ def main():
     teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_model_id)
     
     # Load training dataset (limit for fast experiments)
-    train_dataset = load_training_dataset(teacher_tokenizer, limit=100000, local_rank=local_rank)
+    train_dataset = load_training_dataset(teacher_tokenizer, limit=2000000, local_rank=local_rank)
     print(f"Train dataset size is {train_dataset}")
     
     # Define pruning configurations as tuples: (config_name, new_num_heads, blocks_to_keep_indices)
@@ -61,6 +62,8 @@ def main():
             eval_results[config_name] = results
             print(f"Configuration {config_name} evaluation results:")
             print(results)
+            # import ipdb; ipdb.set_trace()
+            wandb.log({"mtebscore": results[0][0].scores["test"][0].get("main_score")})
     
     # Plot and save the loss curves.
     plt.figure(figsize=(10, 6))
