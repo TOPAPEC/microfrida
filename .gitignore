@@ -4,3 +4,4 @@ distilled_student*
 results*
 student_FRIDA*
 pipeline_runs/
+*.parquet

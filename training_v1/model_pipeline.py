@@ -8,12 +8,20 @@ import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+import logging
 from transformers import T5EncoderModel, T5Config, AutoTokenizer, Trainer, TrainingArguments, TrainerCallback
 from transformers.models.t5.modeling_t5 import T5Attention
 from datasets import load_dataset, Dataset
 from torch.distributed.elastic.multiprocessing.errors import record
 from mteb import MTEB
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+# Configure the root logger to enable logging in DDP.
+root_logger = logging.getLogger()
+if root_logger.handlers:
+    root_logger.handlers = []
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 def prune_linear_layer_generic(linear_layer, top_indices, num_heads_teacher, head_dim):
     d_model = linear_layer.in_features
@@ -107,6 +115,20 @@ class LossHistoryCallback(TrainerCallback):
             self.loss_history.append(logs["loss"])
         return control
 
+class ProgressCallback(TrainerCallback):
+    def on_train_begin(self, args, state, control, **kwargs):
+        if args.local_rank == 0:
+            logger.info("Training started!")
+        return control
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if args.local_rank == 0 and logs is not None:
+            logger.info(f"Step {state.global_step}: {logs}")
+        return control
+    def on_train_end(self, args, state, control, **kwargs):
+        if args.local_rank == 0:
+            logger.info("Training finished!")
+        return control
+
 class DistillationTrainer(Trainer):
     def __init__(self, teacher_model, temperature=2.0, alpha=0.5, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -175,12 +197,16 @@ def run_distillation(teacher_model, student_model, tokenizer, train_dataset, out
         evaluation_strategy="no",
         logging_steps=10,
         save_steps=500,
-        dataloader_num_workers=0,
+        dataloader_num_workers=4,
         warmup_ratio=0.1,
         report_to=["tensorboard"],
-        remove_unused_columns=False
+        remove_unused_columns=False,
+        disable_tqdm=False
     )
+    if local_rank == 0 or True:
+        logger.info("Starting training...")
     loss_callback = LossHistoryCallback()
+    progress_callback = ProgressCallback()
     trainer = DistillationTrainer(
         teacher_model=teacher_model,
         model=student_model,
@@ -190,9 +216,11 @@ def run_distillation(teacher_model, student_model, tokenizer, train_dataset, out
         tokenizer=tokenizer,
         temperature=2.0,
         alpha=0.5,
-        callbacks=[loss_callback]
+        callbacks=[loss_callback, progress_callback]
     )
     trainer.train()
+    if local_rank == 0:
+        logger.info("Training completed.")
     student_path = os.path.join(output_dir, "student")
     student_model.save_pretrained(student_path)
     tokenizer.save_pretrained(student_path)

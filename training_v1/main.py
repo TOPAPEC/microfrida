@@ -8,7 +8,7 @@ def main():
     teacher_model_id = "ai-forever/FRIDA"
     teacher_model = T5EncoderModel.from_pretrained(teacher_model_id)
     teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_model_id)
-    train_dataset = load_training_dataset(teacher_tokenizer, limit=100000)
+    train_dataset = load_training_dataset(teacher_tokenizer, limit=10000)
     # Define different pruning configurations as tuples (config_name, new_num_heads, blocks_to_keep_indices)
     configs = [
         ("config_A", 12, [0, 23]),
