@@ -31,7 +31,7 @@ def plot_parameter_distribution(components, counts):
     plt.xlabel("Number of Parameters")
     plt.title("Parameter Distribution in Student Model")
     plt.tight_layout()
-    bar_chart_path = "parameter_distribution_bar.png"
+    bar_chart_path = "parameter_distribution_bar_6layers2-4.png"
     plt.savefig(bar_chart_path)
     plt.close()
     
@@ -50,7 +50,7 @@ def plot_parameter_distribution(components, counts):
     return bar_chart_path, heatmap_path
 
 def main():
-    model_path = "./student_FRIDA"
+    model_path = "./pipeline_runs/config_E/student_pre_pruned"
     # Load the student model.
     student_model = T5EncoderModel.from_pretrained(model_path)
     

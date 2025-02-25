@@ -16,6 +16,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.nn.parallel import DistributedDataParallel as DDP
+import wandb
 
 root_logger = logging.getLogger()
 if root_logger.handlers:
@@ -169,6 +170,21 @@ def distillation_loss(student_hidden, teacher_hidden, temperature=2.0, alpha=0.5
 
 @record
 def run_distillation(teacher_model, student_model, tokenizer, train_dataset, output_dir, num_train_epochs=1, batch_size=32, learning_rate=2e-5, epoch_to_max_length=None, default_token_len=512):
+    wandb.init(
+        # set the wandb entity where your project will be logged (generally your team name)
+        entity="my-awesome-team-name",
+
+        # set the wandb project where this run will be logged
+        project="my-awesome-project",
+
+        # track hyperparameters and run metadata
+        config={
+        "learning_rate": 1e-4,
+        "architecture": "t5-encoder",
+        "dataset": "RussianProzaTaiga",
+        "epochs": 5,
+        }
+    )
     local_rank = int(os.environ["LOCAL_RANK"]) if "LOCAL_RANK" in os.environ else -1
     device = torch.device(f"cuda:{local_rank}" if local_rank != -1 else ("cuda" if torch.cuda.is_available() else "cpu"))
     torch.cuda.set_device(device)

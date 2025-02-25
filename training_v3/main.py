@@ -29,7 +29,7 @@ def main():
     
     loss_curves = {}
     eval_results = {}
-    output_base = "pipeline_runs"
+    output_base = "pipeline_runs_v2"
     os.makedirs(output_base, exist_ok=True)
     epoch_to_max_length = {0: 128, 1: 128}
     default_token_len = 64
