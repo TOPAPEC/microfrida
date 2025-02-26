@@ -155,7 +155,7 @@ def load_training_dataset(tokenizer, limit=50000, cache_file="tokenized_cache.pa
 
     # All ranks (including rank 0) load the cached dataset
     logger.info(f"Rank {local_rank}: Loading tokenized dataset from cache...")
-    ds = load_dataset("parquet", data_files={"train": cache_file})["train"]
+    ds = load_dataset("parquet", data_files={"train": cache_file}, streaming=True)["train"]
     ds.set_format(type="torch", columns=["input_ids", "attention_mask"])
     return ds
 

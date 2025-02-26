@@ -116,9 +116,9 @@ class FridaModel:
         return torch.cat(all_embeddings, dim=0)
 
 def main():
-    model = FridaModel(model_name="./distilled_student_3layers")
+    model = FridaModel(model_name="pipeline_runs_v2/config_E/student_pre_pruned")
     evaluation = MTEB(tasks=["GeoreviewClusteringP2P"])
-    results = evaluation.run(model, output_folder="results_student_2layers")
+    results = evaluation.run(model, output_folder="results_student_3-3")
     print("\nEvaluation Results:")
     print(results)
     print("\nAnalyzing layer activations...")
