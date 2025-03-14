@@ -7,7 +7,7 @@ import os
 import time
 import gc
 from datetime import timedelta
-from tqdm.auto import tqdm
+from tqdm import tqdm
 from student import FridaDistillationModel
 import wandb
 import random
@@ -15,6 +15,174 @@ from dotenv import load_dotenv
 
 load_dotenv()
 random.seed(42)
+import torch
+import torch.nn.functional as F
+from transformers import AutoTokenizer
+import mteb
+from mteb import MTEB
+import numpy as np
+
+frida_prompts = {
+            "Classification": "categorize: ",
+            "MultilabelClassification": "categorize: ",
+            "Clustering": "categorize_topic: ",
+            "PairClassification": "paraphrase: ",
+            "Reranking": "paraphrase: ",
+            "Reranking-query": "search_query: ",
+            "Reranking-passage": "search_document: ",
+            "STS": "paraphrase: ",
+            "Summarization": "categorize: ",
+            "query": "search_query: ",
+            "passage": "search_document: ",
+            "CEDRClassification": "categorize_sentiment: ",
+            "GeoreviewClassification": "categorize_sentiment: ",
+            "HeadlineClassification": "categorize_topic: ",
+            "InappropriatenessClassification": "categorize_topic: ",
+            "KinopoiskClassification": "categorize_sentiment: ",
+            "MassiveIntentClassification": "paraphrase: ",
+            "MassiveScenarioClassification": "paraphrase: ",
+            "RuReviewsClassification": "categorize_sentiment: ",
+            "RuSciBenchGRNTIClassification": "categorize_topic: ",
+            "RuSciBenchOECDClassification": "categorize_topic: ",
+            "SensitiveTopicsClassification": "categorize_topic: ",
+            "TERRa": "categorize_entailment: ",
+            "RiaNewsRetrieval": "categorize: ",
+            None: "categorize: "
+        }
+# -------------------------------------------
+# TeacherEmbedder: Uses model.get_embedding()
+# -------------------------------------------
+class TeacherEmbedder:
+    def __init__(self, model, tokenizer, max_length=512, prompt="categorize: "):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.prompt = prompt
+
+    def pool(self, hidden_state, mask, pooling_method="cls"):
+        if pooling_method == "mean":
+            s = torch.sum(hidden_state * mask.unsqueeze(-1).float(), dim=1)
+            d = mask.sum(dim=1, keepdim=True).float()
+            return s / d
+        elif pooling_method == "cls":
+            return hidden_state[:, 0]
+
+    def encode(self, texts, batch_size=128, task_type=None, **kwargs):
+        """
+        Encodes a list of sentences by first prepending a prompt (default "categorize: "),
+        tokenizing (max_length=512, padding/truncation enabled), and then processing through
+        the model's teacher pathway (using get_embedding). The output is CLS-pooled and L2-normalized.
+        """
+        all_embeddings = []
+        prompt = frida_prompts[task_type]
+        for i in tqdm(range(0, len(texts), batch_size), desc="Teacher encoding"):
+            # Prepend prompt to each sentence
+            batch_texts = [f"{prompt}{sent}" for sent in texts[i:i + batch_size]]
+            encoded = self.tokenizer(
+                batch_texts,
+                max_length=self.max_length,
+                padding=True,
+                truncation=True,
+                return_tensors="pt"
+            )
+            encoded = {k: v.to(self.model.device) for k, v in encoded.items()}
+            with torch.no_grad():
+                # Get teacher embeddings using model.get_embedding()
+                teacher_outputs = self.model.teacher_model(encoded["input_ids"], encoded["attention_mask"])
+                # Apply CLS pooling (using the first token)
+                embeddings = self.pool(teacher_outputs.last_hidden_state, encoded.get("attention_mask"), pooling_method="cls")
+                embeddings = F.normalize(embeddings, p=2, dim=1)
+            all_embeddings.append(embeddings.cpu())
+        return torch.cat(all_embeddings, dim=0)
+
+
+# -------------------------------------------
+# StudentEmbedder: Uses model forward pass
+# -------------------------------------------
+class StudentEmbedder:
+    def __init__(self, model, tokenizer, max_length=512, prompt="categorize: "):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.prompt = prompt
+
+    def pool(self, hidden_state, mask, pooling_method="cls"):
+        if pooling_method == "mean":
+            s = torch.sum(hidden_state * mask.unsqueeze(-1).float(), dim=1)
+            d = mask.sum(dim=1, keepdim=True).float()
+            return s / d
+        elif pooling_method == "cls":
+            return hidden_state[:, 0]
+
+    def encode(self, texts, batch_size=128, task_type=None, **kwargs):
+        """
+        Encodes a list of sentences by first prepending a prompt (default "categorize: "),
+        tokenizing with max_length=512, and then processing through the student pathway
+        (using the model’s forward pass with output_hidden_states enabled). The output is
+        CLS-pooled and L2-normalized.
+        """
+        all_embeddings = []
+        prompt = frida_prompts[task_type]
+        for i in tqdm(range(0, len(texts), batch_size), desc="Student encoding"):
+            # Prepend prompt to each sentence
+            batch_texts = [f"{prompt}{sent}" for sent in texts[i:i + batch_size]]
+            encoded = self.tokenizer(
+                batch_texts,
+                max_length=self.max_length,
+                padding=True,
+                truncation=True,
+                return_tensors="pt"
+            )
+            encoded = {k: v.to(self.model.device) for k, v in encoded.items()}
+            with torch.no_grad():
+                # Forward pass through the model (student pathway)
+                student_outputs = self.model(
+                    encoded["input_ids"],
+                    encoded["attention_mask"]
+                )
+                # Use CLS pooling on the last hidden state
+                embeddings = self.pool(student_outputs, encoded["attention_mask"], pooling_method="cls")
+                embeddings = F.normalize(embeddings, p=2, dim=1)
+            all_embeddings.append(embeddings.cpu())
+        return torch.cat(all_embeddings, dim=0)
+
+
+# -------------------------------------------
+# evaluate_rumteb: Evaluate on ruMTEB benchmark
+# -------------------------------------------
+def evaluate_rumteb(model, tokenizer, limit=50):
+    """
+    Loads the ruMTEB (Russian part of MTEB) lightweight subset and evaluates both teacher
+    and student representations. Each pathway is wrapped in its corresponding embedder
+    (which applies prompt addition, tokenization, CLS pooling, and normalization), and then
+    the MTEB evaluation object (filtered to Russian tasks via task_langs=["ru"]) is run on each.
+    A side-by-side summary of key evaluation scores is printed.
+    """
+    # Instantiate embedding wrappers for teacher and student with the updated encode() methods.
+    teacher_embedder = TeacherEmbedder(model, tokenizer, max_length=512)
+    student_embedder = StudentEmbedder(model, tokenizer, max_length=512)
+
+    # Create the MTEB evaluation object for Russian tasks, limiting examples for a lightweight run.
+    evaluation = MTEB(tasks=["GeoreviewClusteringP2P"])
+    
+    print("Evaluating teacher embeddings on ruMTEB lightweight subset...")
+    teacher_results = evaluation.run(teacher_embedder, output_folder="results/teacher_rumteb")
+    
+    print("Evaluating student embeddings on ruMTEB lightweight subset...")
+    student_results = evaluation.run(student_embedder, output_folder="results/student_rumteb")
+    
+    # Print a side-by-side comparison of evaluation metrics for each task.
+    print("\nComparison of teacher vs. student on ruMTEB tasks:")
+    header = f"{'Task':30} | {'Teacher Score':15} | {'Student Score':15}"
+    divider = "-" * len(header)
+    print(header)
+    print(divider)
+    teacher_score = teacher_results[0].scores["test"][0].get("main_score")
+    student_score = student_results[0].scores["test"][0].get("main_score")
+    print(f"{'':30} | {str(teacher_score):15} | {str(student_score):15}")
+    
+    return teacher_score, student_score
+
 
 torch.set_float32_matmul_precision('medium')
 
@@ -193,6 +361,7 @@ def train_with_fabric():
         running_loss = 0.0
         log_interval = 100
         wandb_interval = 10
+        eval_interval = 200
         save_interval = 5000
         start_time = time.time()
         plateau_window_size = 20
@@ -240,8 +409,17 @@ def train_with_fabric():
                 running_loss += loss_value
                 loss_history.append(loss_value)
                 grad_norm_history.append(grad_norm.item())
+
+                if global_step % eval_interval == 0:
+                    teacher_res, student_res = evaluate_rumteb(model, tokenizer)
+                    wandb.log({
+                        "metrics/teacher_score": teacher_res,
+                        "metrics/student_score": student_res,
+                    }, step=global_step)
+
                 global_step += 1
                 pbar.update(1)
+
                 
                 if global_step % wandb_interval == 0 and fab.global_rank == 0:  # Only log on the main process
                     elapsed = time.time() - start_time
@@ -281,7 +459,7 @@ def train_with_fabric():
                             "train/loss_std": loss_std,
                             "train/learning_rate": scheduler.get_last_lr()[0],
                             "train/step": global_step,
-                            "train/steps_per_second": log_interval/elapsed,
+                            "train/steps_per_second": wandb_interval/elapsed,
                             "train/gradient_norm": grad_norm.item(),
                             
                             # Convergence metrics

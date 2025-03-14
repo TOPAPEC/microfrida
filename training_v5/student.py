@@ -40,7 +40,7 @@ class FridaDistillationModel(nn.Module):
         embeddings = F.embedding(input_ids, self.teacher_embeddings)
         return self.embedding_transform(embeddings)
     
-    def forward(self, input_ids, attention_mask=None):
+    def forward(self, input_ids, attention_mask=None, **kwargs):
         # attention_mask = attention_mask.to(self.device)
         # input_ids = input_ids.to(self.device)
         hidden_states = self.get_embedding(input_ids)
