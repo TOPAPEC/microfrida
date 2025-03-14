@@ -1,7 +1,7 @@
 import torch
 from torch.utils.data import DataLoader
 from datasets import load_dataset
-from transformers import AutoTokenizer, get_linear_schedule_with_warmup
+from transformers import AutoTokenizer, get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
 import lightning.fabric as fabric
 import os
 import time
@@ -9,6 +9,12 @@ import gc
 from datetime import timedelta
 from tqdm.auto import tqdm
 from student import FridaDistillationModel
+import wandb
+import random
+from dotenv import load_dotenv
+
+load_dotenv()
+random.seed(42)
 
 torch.set_float32_matmul_precision('medium')
 
@@ -63,6 +69,22 @@ def train_with_fabric():
     # Initialize Fabric
     fab = fabric.Fabric(accelerator="auto", devices="auto", precision="16-mixed")
     fab.launch()
+
+    if fab.global_rank == 0:  # Only initialize wandb on the main process
+        wandb.init(
+            project="frida-distillation",
+            name=f"distil-frida-{time.strftime('%Y%m%d-%H%M%S')}",
+            config={
+                "hidden_size": 368,
+                "num_heads": 8,
+                "num_layers": 3,
+                "batch_size": 128,
+                "learning_rate": 5e-4,
+                "weight_decay": 0.01,
+                "max_steps": 100000,
+                "warmup_steps": 5000,
+            }
+        )
     
     # Initialize model and tokenizer
     tokenizer = AutoTokenizer.from_pretrained("ai-forever/FRIDA")
@@ -72,13 +94,33 @@ def train_with_fabric():
     model = fab.setup_module(model)
     
     # Find optimal batch size
-    with fab.init_module():
-        batch_size = find_optimal_batch_size(model, tokenizer)
+    # with fab.init_module():
+    #     batch_size = find_optimal_batch_size(model, tokenizer)
+    batch_size = 128
     
     # Collate function
     def collate_fn(batch):
         try:
-            texts = [item['text'][:10000] for item in batch]  # Truncate very long texts
+            prefixes = [
+                "search_query: ",
+                "search_document: ",
+                "paraphrase: ",
+                "categorize: ",
+                "categorize_sentiment: ",
+                "categorize_topic: ",
+                "categorize_entailment: "
+            ]
+            
+            # Extract texts and truncate very long ones
+            raw_texts = [item['text'][:10000] for item in batch]
+            
+            # Prepend random prefixes to each text
+            texts = []
+            for text in raw_texts:
+                # Select a random prefix
+                prefix = random.choice(prefixes)
+                # Prepend prefix to text
+                texts.append(prefix + text)
             
             tokenizer_output = tokenizer(
                 texts,
@@ -99,14 +141,14 @@ def train_with_fabric():
     # Setup optimizer and scheduler
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
-        lr=3e-5,
+        lr=5e-5,
         weight_decay=0.01
     )
     
-    max_steps = 100000
-    warmup_steps = 5000
+    max_steps = 20000
+    warmup_steps = 2000
     
-    scheduler = get_linear_schedule_with_warmup(
+    scheduler = get_cosine_schedule_with_warmup(
         optimizer, 
         num_warmup_steps=warmup_steps,
         num_training_steps=max_steps
@@ -123,7 +165,7 @@ def train_with_fabric():
     dataset = dataset.shuffle(buffer_size=10000, seed=42)
     
     # Setup dataloader
-    num_workers = min(4, os.cpu_count() or 2)
+    num_workers = min(8, os.cpu_count() or 2)
     
     dataloader = DataLoader(
         dataset,
@@ -150,8 +192,14 @@ def train_with_fabric():
         data_iter = iter(dataloader)
         running_loss = 0.0
         log_interval = 100
+        wandb_interval = 10
         save_interval = 5000
         start_time = time.time()
+        plateau_window_size = 20
+        plateau_threshold = 0.001
+        loss_history = []
+        grad_norm_history = []
+        is_in_plateau = False
         
         while global_step < max_steps:
             try:
@@ -184,25 +232,88 @@ def train_with_fabric():
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 scheduler.step()
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.zero_grad()
                 
                 # Update metrics
                 loss_value = loss.item()
                 running_loss += loss_value
+                loss_history.append(loss_value)
+                grad_norm_history.append(grad_norm.item())
                 global_step += 1
                 pbar.update(1)
                 
+                if global_step % wandb_interval == 0 and fab.global_rank == 0:  # Only log on the main process
+                    elapsed = time.time() - start_time
+                    recent_losses = loss_history[-plateau_window_size:]
+                    loss_mean = sum(recent_losses) / len(recent_losses)
+                    loss_std = (sum((x - loss_mean)**2 for x in recent_losses) / len(recent_losses))**0.5
+                    if len(loss_history) > plateau_window_size:
+                        # Keep only recent history
+                        if len(loss_history) > plateau_window_size * 2:
+                            loss_history = loss_history[-plateau_window_size*2:]
+                            grad_norm_history = grad_norm_history[-plateau_window_size*2:]
+                
+                        # Calculate metrics
+                        prev_losses = loss_history[-plateau_window_size*2:-plateau_window_size]
+                        
+                        
+                        prev_loss_mean = sum(prev_losses) / len(prev_losses)
+                        relative_improvement = (prev_loss_mean - loss_mean) / prev_loss_mean
+                        
+                        # First derivative approximation (rate of change)
+                        loss_derivative = (prev_loss_mean - loss_mean) / plateau_window_size
+                        
+                        # Detect plateau
+                        was_in_plateau = is_in_plateau
+                        is_in_plateau = relative_improvement < plateau_threshold
+                        
+                        # Calculate rate of convergence metrics
+                        if not is_in_plateau:
+                            convergence_rate = -loss_derivative / loss_mean
+                            time_to_convergence_estimate = loss_mean / abs(loss_derivative) if loss_derivative != 0 else float('inf')
+                        else:
+                            convergence_rate = 0
+                            time_to_convergence_estimate = float('inf')
+                        wandb.log({
+                            "train/loss": loss_value,
+                            "train/avg_loss": loss_mean,
+                            "train/loss_std": loss_std,
+                            "train/learning_rate": scheduler.get_last_lr()[0],
+                            "train/step": global_step,
+                            "train/steps_per_second": log_interval/elapsed,
+                            "train/gradient_norm": grad_norm.item(),
+                            
+                            # Convergence metrics
+                            "convergence/relative_improvement": relative_improvement,
+                            "convergence/loss_derivative": loss_derivative,
+                            "convergence/is_plateau": 1 if is_in_plateau else 0,
+                            "convergence/rate": convergence_rate,
+                            "convergence/time_to_convergence_est": min(time_to_convergence_estimate, 100000)
+                        }, step=global_step)
+                    else:
+                        wandb.log({
+                            "train/loss": loss_value,
+                            "train/avg_loss": loss_mean,
+                            "train/loss_std": loss_std,
+                            "train/learning_rate": scheduler.get_last_lr()[0],
+                            "train/step": global_step,
+                            "train/steps_per_second": log_interval/elapsed,
+                            "train/gradient_norm": grad_norm.item(),
+                        }, step=global_step)
+
+                    start_time = time.time()
                 # Logging
                 if global_step % log_interval == 0:
                     avg_loss = running_loss / log_interval
-                    elapsed = time.time() - start_time
                     
                     fab.print(
                         f"Step: {global_step} | "
                         f"Loss: {avg_loss:.4f} | "
-                        f"Speed: {log_interval/elapsed:.1f} it/s | "
                         f"LR: {scheduler.get_last_lr()[0]:.6f}"
                     )
+
+
                     
                     # Save best model
                     if avg_loss < best_loss:
@@ -214,7 +325,6 @@ def train_with_fabric():
                         })
                     
                     running_loss = 0.0
-                    start_time = time.time()
                 
                 # Checkpoint saving
                 if global_step % save_interval == 0:
@@ -232,6 +342,13 @@ def train_with_fabric():
             
             except Exception as e:
                 fab.print(f"Error in training step: {str(e)}")
+                import traceback
+                print("=" * 80)
+                print("TRAINING ERROR:")
+                print("-" * 80)
+                traceback.print_exc()
+                print("=" * 80)
+
                 # Continue with next batch
                 continue
             

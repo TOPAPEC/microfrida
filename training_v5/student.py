@@ -20,19 +20,19 @@ class FridaDistillationModel(nn.Module):
         self.num_layers = num_layers
         self.head_dim = hidden_size // num_heads
         
-        self.embedding_transform = nn.Linear(self.teacher_embedding_dim, hidden_size)
+        self.embedding_transform = nn.Linear(self.teacher_embedding_dim, hidden_size).to(self.device)
         
         self.teacher_embeddings = nn.Parameter(
             self.teacher_model.shared.weight.clone(), 
             requires_grad=False
-        )
+        ).to(self.device)
         
         self.layers = nn.ModuleList([
-            TransformerLayer(hidden_size, num_heads, hidden_size * 4) 
+            TransformerLayer(hidden_size, num_heads, hidden_size * 4).to(self.device)
             for _ in range(num_layers)
         ])
         
-        self.layer_norm = nn.LayerNorm(hidden_size)
+        self.layer_norm = nn.LayerNorm(hidden_size).to(self.device)
         self.to(self.device)
         
     def get_embedding(self, input_ids):
@@ -41,12 +41,14 @@ class FridaDistillationModel(nn.Module):
         return self.embedding_transform(embeddings)
     
     def forward(self, input_ids, attention_mask=None):
+        # attention_mask = attention_mask.to(self.device)
+        # input_ids = input_ids.to(self.device)
         hidden_states = self.get_embedding(input_ids)
         
         # Process through transformer layers
         batch_size, seq_len = input_ids.shape
         if attention_mask is None:
-            attention_mask = torch.ones(batch_size, seq_len, device=self.device)
+            attention_mask = torch.ones(batch_size, seq_len, device=self.device).to(self.device)
             
         # Convert attention mask for transformer
         extended_mask = (1.0 - attention_mask[:, None, None, :]) * -10000.0
@@ -61,6 +63,8 @@ class FridaDistillationModel(nn.Module):
         return hidden_states
     
     def get_qkv_matrices(self, input_ids, attention_mask=None):
+        input_ids = input_ids.to(self.device)
+        attention_mask = attention_mask.to(self.device)
         """Get QKV matrices for distillation loss calculation"""
         # Student QKV
         hidden_states = self.forward(input_ids, attention_mask)
@@ -101,23 +105,56 @@ class FridaDistillationModel(nn.Module):
         }
     
     def compute_distillation_loss(self, input_ids, attention_mask=None):
-        """Compute MiniLMv2 distillation loss (Q-Q, K-K, V-V relations)"""
+        """Compute MiniLMv2 distillation loss with relation heads projection"""
         qkv_dict = self.get_qkv_matrices(input_ids, attention_mask)
         
         student_q, student_k, student_v = qkv_dict['student'].values()
         teacher_q, teacher_k, teacher_v = qkv_dict['teacher'].values()
         
-        # Compute relations
-        student_q_q = torch.matmul(student_q, student_q.transpose(-1, -2)) / torch.sqrt(torch.tensor(self.head_dim, dtype=student_q.dtype))
-        student_k_k = torch.matmul(student_k, student_k.transpose(-1, -2)) / torch.sqrt(torch.tensor(self.head_dim, dtype=student_k.dtype))
-        student_v_v = torch.matmul(student_v, student_v.transpose(-1, -2)) / torch.sqrt(torch.tensor(self.head_dim, dtype=student_v.dtype))
+        # Get shapes and determine relation heads
+        batch_size, student_heads, seq_len, student_head_dim = student_q.shape
+        _, teacher_heads, _, teacher_head_dim = teacher_q.shape
         
-        teacher_head_dim = teacher_q.size(-1)
-        teacher_q_q = torch.matmul(teacher_q, teacher_q.transpose(-1, -2)) / torch.sqrt(torch.tensor(teacher_head_dim, dtype=teacher_q.dtype))
-        teacher_k_k = torch.matmul(teacher_k, teacher_k.transpose(-1, -2)) / torch.sqrt(torch.tensor(teacher_head_dim, dtype=teacher_k.dtype))
-        teacher_v_v = torch.matmul(teacher_v, teacher_v.transpose(-1, -2)) / torch.sqrt(torch.tensor(teacher_head_dim, dtype=teacher_v.dtype))
+        # Set number of relation heads (can be different from both teacher and student)
+        # Using a fixed number like 12 or 24 as in the paper
+        num_relation_heads = 8
         
-        # Apply softmax
+        # Project to relation heads through reshape operations
+        # Student relation projections
+        student_q_for_relation = student_q.transpose(1, 2).reshape(batch_size, seq_len, -1)
+        student_k_for_relation = student_k.transpose(1, 2).reshape(batch_size, seq_len, -1)
+        student_v_for_relation = student_v.transpose(1, 2).reshape(batch_size, seq_len, -1)
+        
+        # Split to relation heads
+        student_rq = student_q_for_relation.view(batch_size, seq_len, num_relation_heads, -1).transpose(1, 2)
+        student_rk = student_k_for_relation.view(batch_size, seq_len, num_relation_heads, -1).transpose(1, 2)
+        student_rv = student_v_for_relation.view(batch_size, seq_len, num_relation_heads, -1).transpose(1, 2)
+        
+        # Teacher relation projections
+        teacher_q_for_relation = teacher_q.transpose(1, 2).reshape(batch_size, seq_len, -1)
+        teacher_k_for_relation = teacher_k.transpose(1, 2).reshape(batch_size, seq_len, -1)
+        teacher_v_for_relation = teacher_v.transpose(1, 2).reshape(batch_size, seq_len, -1)
+        
+        # Split to relation heads
+        teacher_rq = teacher_q_for_relation.view(batch_size, seq_len, num_relation_heads, -1).transpose(1, 2)
+        teacher_rk = teacher_k_for_relation.view(batch_size, seq_len, num_relation_heads, -1).transpose(1, 2)
+        teacher_rv = teacher_v_for_relation.view(batch_size, seq_len, num_relation_heads, -1).transpose(1, 2)
+        
+        # Compute relations with aligned dimensions
+        student_relation_dim = student_rq.size(-1)
+        teacher_relation_dim = teacher_rq.size(-1)
+        
+        # Student relations
+        student_q_q = torch.matmul(student_rq, student_rq.transpose(-1, -2)) / torch.sqrt(torch.tensor(student_relation_dim, dtype=student_rq.dtype))
+        student_k_k = torch.matmul(student_rk, student_rk.transpose(-1, -2)) / torch.sqrt(torch.tensor(student_relation_dim, dtype=student_rk.dtype))
+        student_v_v = torch.matmul(student_rv, student_rv.transpose(-1, -2)) / torch.sqrt(torch.tensor(student_relation_dim, dtype=student_rv.dtype))
+        
+        # Teacher relations
+        teacher_q_q = torch.matmul(teacher_rq, teacher_rq.transpose(-1, -2)) / torch.sqrt(torch.tensor(teacher_relation_dim, dtype=teacher_rq.dtype))
+        teacher_k_k = torch.matmul(teacher_rk, teacher_rk.transpose(-1, -2)) / torch.sqrt(torch.tensor(teacher_relation_dim, dtype=teacher_rk.dtype))
+        teacher_v_v = torch.matmul(teacher_rv, teacher_rv.transpose(-1, -2)) / torch.sqrt(torch.tensor(teacher_relation_dim, dtype=teacher_rv.dtype))
+        
+        # Apply softmax to get proper probability distributions
         student_q_q = F.softmax(student_q_q, dim=-1)
         student_k_k = F.softmax(student_k_k, dim=-1)
         student_v_v = F.softmax(student_v_v, dim=-1)
@@ -126,7 +163,7 @@ class FridaDistillationModel(nn.Module):
         teacher_k_k = F.softmax(teacher_k_k, dim=-1)
         teacher_v_v = F.softmax(teacher_v_v, dim=-1)
         
-        # KL divergence
+        # KL divergence for distillation
         with torch.cuda.amp.autocast(enabled=False):
             loss_q_q = F.kl_div(torch.log(student_q_q + 1e-10), teacher_q_q, reduction='batchmean', log_target=False)
             loss_k_k = F.kl_div(torch.log(student_k_k + 1e-10), teacher_k_k, reduction='batchmean', log_target=False)
@@ -134,6 +171,7 @@ class FridaDistillationModel(nn.Module):
         
         total_loss = loss_q_q + loss_k_k + loss_v_v
         return total_loss
+
 
 class SelfAttention(nn.Module):
     def __init__(self, hidden_size, num_heads):

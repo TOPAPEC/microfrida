@@ -8,3 +8,4 @@ pipeline_runs_v2/
 *.parquet
 wandb/
 hf_datasets/
+.env

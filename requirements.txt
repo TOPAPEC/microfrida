@@ -9,3 +9,4 @@ accelerate>=0.26.0
 tensorboardX
 wandb
 lightning
+python-dotenv
